@@ -468,17 +468,85 @@ def make_profile(domain):
     return public, shortid
 
 
-def render_site(domain):
+def render_site(domain, source=None, site=SITE):
     choices = sorted((ROOT / 'templates').glob('*/index.html'))
     if len(choices) != 20:
         raise RuntimeError(f'Ожидается 20 шаблонов; найдено {len(choices)}')
-    source = random.SystemRandom().choice(choices)
-    SITE.mkdir(parents=True, exist_ok=True)
+    source = source or random.SystemRandom().choice(choices)
+    if source not in choices:
+        raise ValueError('Неизвестный шаблон сайта')
+    site.mkdir(parents=True, exist_ok=True)
     for filename in ('index.html', '404.html', 'favicon.svg'):
-        shutil.copy2(source.parent / filename, SITE / filename)
-    (SITE / 'robots.txt').write_text(f'User-agent: *\nAllow: /\nSitemap: https://{domain}/sitemap.xml\n', encoding='utf-8')
-    (SITE / 'sitemap.xml').write_text(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://{domain}/</loc></url></urlset>\n', encoding='utf-8')
+        shutil.copy2(source.parent / filename, site / filename)
+    (site / 'robots.txt').write_text(f'User-agent: *\nAllow: /\nSitemap: https://{domain}/sitemap.xml\n', encoding='utf-8')
+    (site / 'sitemap.xml').write_text(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://{domain}/</loc></url></urlset>\n', encoding='utf-8')
     return source.parent.name
+
+
+def change_site():
+    heading('Смена сайта-заглушки')
+    if not CURRENT.exists():
+        raise RuntimeError('Активная установка не найдена. Сначала установите Selfsteal.')
+    state = read_state()
+    domain = state.get('domain', '')
+    if not valid_domain(domain):
+        raise RuntimeError('В состоянии установки не найден корректный домен.')
+    if SITE.is_symlink() or not SITE.is_dir():
+        raise RuntimeError('Каталог сайта отсутствует или является ссылкой; проверьте его вручную.')
+    if not CONF.is_file() or not ENABLED.exists() or not status_service('nginx', 'is-active'):
+        raise RuntimeError('Конфигурация Selfsteal не подключена или nginx не запущен.')
+    choices = sorted((ROOT / 'templates').glob('*/index.html'))
+    if len(choices) != 20:
+        raise RuntimeError(f'Ожидается 20 шаблонов; найдено {len(choices)}')
+    print(f'  Домен: {domain}')
+    print('  Доступные варианты:')
+    for number, source in enumerate(choices, 1):
+        title = re.search(r'<title>(.*?)</title>', source.read_text(encoding='utf-8'), re.I | re.S)
+        name = re.sub(r'\s+', ' ', title.group(1)).strip() if title else source.parent.name
+        print(f'  {number:2}. {source.parent.name} — {name}')
+    print('   0. Назад')
+    selected = prompt('Номер сайта: ').strip()
+    if selected == '0':
+        return
+    if not selected.isdigit() or not 1 <= int(selected) <= len(choices):
+        raise ValueError('Выберите номер из списка или 0 для возврата.')
+    source = choices[int(selected) - 1]
+    if not confirm(f'Заменить сайт на {source.parent.name}?'):
+        notice('Смена сайта отменена.')
+        return
+    run('nginx', '-t')
+    # Keep the previous site on the same filesystem until the reload succeeds.
+    temp = Path(tempfile.mkdtemp(prefix='.selfsteal-change-', dir=SITE.parent))
+    candidate, previous = temp / 'new', temp / 'previous'
+    completed = False
+    try:
+        shutil.copytree(SITE, candidate, symlinks=True)
+        for name in ('index.html', '404.html', 'favicon.svg', 'robots.txt', 'sitemap.xml'):
+            path = candidate / name
+            if path.is_symlink() or path.is_dir():
+                raise RuntimeError(f'Небезопасный файл в каталоге сайта: {name}')
+        render_site(domain, source, candidate)
+        os.rename(SITE, previous)
+        try:
+            os.rename(candidate, SITE)
+            run('nginx', '-t')
+            run('systemctl', 'reload', 'nginx')
+            completed = True
+        except BaseException:
+            if SITE.exists():
+                os.rename(SITE, candidate)
+            os.rename(previous, SITE)
+            run('systemctl', 'reload', 'nginx', check=False)
+            raise
+    finally:
+        # Do not delete the original if restoring it failed.
+        if completed or not previous.exists():
+            shutil.rmtree(temp, ignore_errors=True)
+        else:
+            print('Предыдущий сайт сохранён в ' + str(previous), file=sys.stderr)
+    notice('Сайт заменён: ' + source.parent.name, 'ok')
+    notice('nginx перезагружен; robots.txt и sitemap.xml обновлены для ' + domain, 'ok')
+    print('  Откройте https://' + domain + '/ и при необходимости обновите страницу без кэша.')
 
 
 def check_report(domain, ip, public, shortid, template, snapshot):
@@ -632,7 +700,8 @@ def main():
         heading('ГЛАВНОЕ МЕНЮ')
         print(f'  {styled("[1]", "cyan", True)}  Установить Selfsteal')
         print(f'  {styled("[2]", "cyan", True)}  Откатить последнюю установку')
-        print(f'  {styled("[3]", "cyan", True)}  Выход из скрипта')
+        print(f'  {styled("[3]", "cyan", True)}  Изменить сайт-заглушку')
+        print(f'  {styled("[4]", "cyan", True)}  Выход из скрипта')
         try:
             choice = prompt('Выберите действие: ').strip().casefold()
             if choice == '1':
@@ -642,11 +711,13 @@ def main():
                     notice('Активный снимок не найден.', 'warn')
                 elif confirm('Откатить конфигурацию этого установщика?'):
                     rollback(read_state())
-            elif choice in ('3', '0', 'q', 'quit', 'exit', 'выход'):
+            elif choice == '3':
+                change_site()
+            elif choice in ('4', '0', 'q', 'quit', 'exit', 'выход'):
                 notice('Скрипт завершён. Вы вернулись в командную строку.', 'ok')
                 return
             else:
-                notice('Выберите 1, 2 или 3.', 'warn')
+                notice('Выберите 1, 2, 3 или 4.', 'warn')
         except (EOFError, KeyboardInterrupt):
             print()
             notice('Скрипт завершён. Вы вернулись в командную строку.', 'ok')
