@@ -2,6 +2,7 @@
 """Install a local HTTPS REALITY target without changing the Remnawave panel."""
 import base64
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import os
@@ -13,7 +14,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
+import urllib.error
 from pathlib import Path
 
 os.environ['LC_ALL'] = 'C'
@@ -30,8 +33,55 @@ PROFILE = STATE / 'reality-inbound.json'
 SSH_MARK = 'selfsteal-installer-'
 
 
+def styled(text, color='cyan', bold=False):
+    """Use ANSI styling only on capable interactive terminals."""
+    if not sys.stdout.isatty() or os.environ.get('TERM') == 'dumb' or 'NO_COLOR' in os.environ:
+        return str(text)
+    colors = {'cyan': '36', 'green': '32', 'yellow': '33', 'red': '31',
+              'white': '37', 'muted': '90'}
+    return f'\033[{"1;" if bold else ""}{colors.get(color, "36")}m{text}\033[0m'
+
+
+def heading(title):
+    print('\n' + styled('  ──  ' + title + '  ' + '─' * 30, 'cyan', True))
+
+
+def notice(message, kind='info'):
+    icon, color = {'info': ('i', 'cyan'), 'ok': ('✓', 'green'),
+                   'warn': ('!', 'yellow'), 'error': ('×', 'red')}[kind]
+    print(f'  {styled("[" + icon + "]", color, True)} {message}')
+
+
+def prompt(message):
+    return input(styled('  › ', 'cyan', True) + message)
+
+
+def confirm(message):
+    return prompt(message + ' [да/нет]: ').strip().casefold() in ('y', 'yes', 'д', 'да')
+
+
+def banner():
+    logo = [
+        r'   ____       _  __     _             _ ',
+        r'  / ___|  ___| |/ _|___| |_ ___  __ _| |',
+        r'  \___ \ / _ \ | |_/ __| __/ _ \/ _` | |',
+        r'   ___) |  __/ |  _\__ \ ||  __/ (_| | |',
+        r'  |____/ \___|_|_| |___/\__\___|\__,_|_|',
+    ]
+    print()
+    for line in logo:
+        print(styled(line, 'cyan', True))
+    print(styled('  REALITY  /  SERVER SETUP', 'muted'))
+    if (sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
+            and not os.environ.get('SELFSTEAL_NO_ANIMATION')):
+        for frame in ('◐', '◓', '◑', '◒'):
+            print('\r' + styled('  ' + frame + '  Подготовка интерфейса', 'cyan'), end='', flush=True)
+            time.sleep(0.06)
+        print('\r' + ' ' * 38 + '\r', end='', flush=True)
+
+
 def run(*args, check=True, capture=False, input_text=None):
-    print('+', ' '.join(str(x) for x in args), flush=True)
+    print(styled('  $ ', 'muted') + ' '.join(str(x) for x in args), flush=True)
     return subprocess.run(args, check=check, text=True, input=input_text,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None)
@@ -72,22 +122,122 @@ def status_service(name, action):
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
+def listener_rows(port=None):
+    p = subprocess.run(['ss', '-H', '-lntp'], text=True, capture_output=True, check=True)
+    rows = [row for row in p.stdout.splitlines() if len(row.split()) >= 4]
+    return [row for row in rows if row.split()[3].rsplit(':', 1)[-1] == str(port)] if port else rows
+
+
 def is_listening(port):
-    p = subprocess.run(['ss', '-H', '-lnt'], text=True, capture_output=True, check=True)
-    return any(row.split()[3].rsplit(':', 1)[-1] == str(port)
-               for row in p.stdout.splitlines() if len(row.split()) >= 4)
+    return bool(listener_rows(port))
+
+
+def packaged_nginx_configs_match(nginx_root=Path('/etc/nginx')):
+    """Require the two Debian/Ubuntu conffiles to match their installed package hashes."""
+    query = subprocess.run(['dpkg-query', '-W', '-f=${Conffiles}', 'nginx-common'],
+                           text=True, capture_output=True, check=False)
+    if query.returncode:
+        return False
+    hashes = {}
+    for line in query.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r'[0-9a-fA-F]{32}', parts[1]):
+            hashes[parts[0]] = parts[1].lower()
+    for path in (nginx_root / 'nginx.conf', nginx_root / 'sites-available/default'):
+        if str(path) not in hashes or not path.is_file():
+            return False
+        # MD5 is used here only to compare against dpkg's own conffile database.
+        if hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest() != hashes[str(path)]:
+            return False
+    return True
+
+
+def inspect_default_nginx(nginx_root=Path('/etc/nginx')):
+    """Recognise a stock Debian/Ubuntu nginx setup conservatively, without changing it."""
+    if not shutil.which('nginx') or not shutil.which('dpkg-query'):
+        return False, 'nginx или dpkg-query не найден'
+    if not status_service('nginx', 'is-active'):
+        return False, 'системная служба nginx не активна'
+    rows = listener_rows(80)
+    if not rows:
+        return False, 'порт 80 больше не занят'
+    main_pid = output('systemctl', 'show', 'nginx', '--property=MainPID', '--value')
+    if not main_pid.isdigit() or int(main_pid) <= 0:
+        return False, 'не удалось определить процесс системной службы nginx'
+    for row in rows:
+        processes = re.findall(r'"([^"\n]+)"', row)
+        if not processes or any(name != 'nginx' for name in processes):
+            return False, 'порт 80 занимает не только системный nginx'
+        if main_pid not in re.findall(r'pid=(\d+)', row):
+            return False, 'порт 80 не принадлежит системной службе nginx'
+    for row in listener_rows():
+        processes = re.findall(r'"([^"\n]+)"', row)
+        if 'nginx' in processes and row.split()[3].rsplit(':', 1)[-1] != '80':
+            return False, 'nginx также слушает другие порты; проверьте его действующую конфигурацию'
+    enabled_dir = nginx_root / 'sites-enabled'
+    default = enabled_dir / 'default'
+    if not default.is_symlink() or not default.exists():
+        return False, 'стандартный сайт nginx не подключён обычной символьной ссылкой'
+    if default.resolve() != (nginx_root / 'sites-available/default').resolve():
+        return False, 'ссылка default указывает на нестандартный файл'
+    if {p.name for p in enabled_dir.iterdir()} != {'default'}:
+        return False, 'обнаружены другие файлы в sites-enabled'
+    conf_dir = nginx_root / 'conf.d'
+    if conf_dir.is_dir() and any(conf_dir.glob('*.conf')):
+        return False, 'обнаружены дополнительные настройки в conf.d'
+    if not packaged_nginx_configs_match(nginx_root):
+        return False, 'конфигурация nginx отличается от файлов пакета или их контрольные суммы недоступны'
+    config = subprocess.run(['nginx', '-T'], text=True, capture_output=True, check=False)
+    if config.returncode:
+        return False, 'nginx -T сообщает об ошибке'
+    loaded = re.findall(r'^# configuration file (.+):$', config.stdout, re.MULTILINE)
+    required = {str(nginx_root / 'nginx.conf'), str(default)}
+    if not required.issubset(set(loaded)):
+        return False, 'nginx использует нестандартный набор конфигурационных файлов'
+    for path in loaded:
+        if path in required or path == str(nginx_root / 'mime.types'):
+            continue
+        module_path = Path(path)
+        if module_path.parent != nginx_root / 'modules-enabled':
+            return False, 'nginx загружает дополнительную конфигурацию: ' + path
+        try:
+            lines = [line.split('#', 1)[0].strip() for line in module_path.read_text(encoding='utf-8').splitlines()]
+        except OSError:
+            return False, 'не удалось прочитать конфигурацию модуля: ' + path
+        if any(line and not re.fullmatch(r'load_module\s+[^;]+;', line) for line in lines):
+            return False, 'обнаружена дополнительная конфигурация модуля: ' + path
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open('http://127.0.0.1/', timeout=5) as response:
+            body = response.read(65536).decode('utf-8', errors='replace')
+            if response.status != 200 or '<title>Welcome to nginx!</title>' not in body:
+                return False, 'на 127.0.0.1:80 отображается не стандартная страница nginx'
+    except (OSError, urllib.error.URLError):
+        return False, 'не удалось проверить страницу nginx на 127.0.0.1:80'
+    return True, 'обнаружена стандартная страница nginx'
 
 
 def info():
-    print('\n=== Информация о сервере ===')
-    print('Узел:', socket.gethostname())
-    print('ОС:', output('bash', '-c', '. /etc/os-release; printf "%s" "$PRETTY_NAME"'))
-    print('Ядро:', output('uname', '-r'))
-    print('IPv4:', output('hostname', '-I') or 'не определён')
-    print('Порты 80/443/8443:')
-    print(output('ss', '-lntp') or 'нет данных')
-    print('nginx:', output('nginx', '-v') or ('установлен' if shutil.which('nginx') else 'не установлен'))
-    print('Снимок:', str(CURRENT) if CURRENT.exists() else 'нет активной установки')
+    heading('ИНФОРМАЦИЯ О СЕРВЕРЕ')
+    os_name = output('bash', '-c', '. /etc/os-release; printf "%s" "$PRETTY_NAME"')
+    nginx_version = 'не установлен'
+    if shutil.which('nginx'):
+        version = subprocess.run(['nginx', '-v'], text=True, capture_output=True, check=False)
+        nginx_version = (version.stderr or version.stdout).strip() or 'установлен'
+    print(f'  Узел        {socket.gethostname()}')
+    print(f'  ОС          {os_name}')
+    print(f'  Ядро        {output("uname", "-r")}')
+    print(f'  IP-адреса   {output("hostname", "-I") or "не определены"}')
+    print(f'  nginx       {nginx_version}')
+    print(f'  Снимок      {str(CURRENT) if CURRENT.exists() else "нет активной установки"}')
+    print()
+    for port in (80, 443, 8443):
+        rows = listener_rows(port)
+        status = styled('занят', 'yellow') if rows else styled('свободен', 'green')
+        print(f'  TCP {port:<5}  {status}')
+        for row in rows:
+            processes = re.findall(r'"([^"\n]+)"', row)
+            print('             ' + styled(', '.join(sorted(set(processes))) or row.strip(), 'muted'))
 
 
 def valid_domain(domain):
@@ -105,13 +255,14 @@ def server_ip():
 
 
 def input_parameters():
-    domain = input('Домен (A-запись на этот сервер): ').strip().lower().rstrip('.')
+    heading('ДОМЕН И СЕРТИФИКАТ')
+    domain = prompt('Домен (A-запись на этот сервер): ').strip().lower().rstrip('.')
     if not valid_domain(domain):
         raise ValueError('Некорректный домен. Используйте полное имя в ASCII, например node.example.com.')
     suggested = server_ip()
-    raw_ip = input(f'Публичный IPv4 сервера [{suggested}]: ').strip() or suggested
+    raw_ip = prompt(f'Публичный IPv4 сервера [{suggested}]: ').strip() or suggested
     ip = str(ipaddress.IPv4Address(raw_ip))
-    email = input('Email для Let\'s Encrypt: ').strip()
+    email = prompt('Email для Let\'s Encrypt: ').strip()
     if not re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+', email):
         raise ValueError('Укажите корректный email.')
     addresses = {row[4][0] for row in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
@@ -209,7 +360,8 @@ def delete_ufw_rules(marker):
 def rollback(state):
     backup = Path(state['backup'])
     errors = []
-    print('\nВосстановление файлов и правил UFW из', backup)
+    heading('ВОССТАНОВЛЕНИЕ')
+    notice('Восстановление файлов и правил UFW из ' + str(backup))
     try:
         delete_ufw_rules(state['marker'])
         if not state.get('ufw_was_active', False) and shutil.which('ufw') and ufw_active():
@@ -238,11 +390,12 @@ def rollback(state):
         if run('certbot', 'delete', '--non-interactive', '--cert-name', state['cert_name'], check=False).returncode:
             errors.append('Не удалось удалить созданный сертификат; сохраните snapshot для ручного восстановления')
     if errors:
-        print('Не всё восстановлено:', *errors, sep='\n - ')
+        notice('Не всё восстановлено:', 'error')
+        print(*errors, sep='\n - ')
         print('Снимок сохранён; исправьте ошибки и повторите откат.')
         return False
     CURRENT.unlink(missing_ok=True)
-    print('Откат файлов и правил завершён. Установленные apt-пакеты и зависимости сохранены.')
+    notice('Откат файлов и правил завершён. Установленные apt-пакеты и зависимости сохранены.', 'ok')
     return True
 
 
@@ -329,7 +482,7 @@ def render_site(domain):
 
 
 def check_report(domain, ip, public, shortid, template, snapshot):
-    print('\n=== Результат ===')
+    heading('РЕЗУЛЬТАТ УСТАНОВКИ')
     print('Домен:', domain, '| IP:', ip, '| Шаблон:', template)
     print('Снимок:', snapshot)
     print('JSON inbound (содержит приватный ключ):', PROFILE)
@@ -348,11 +501,11 @@ def check_report(domain, ip, public, shortid, template, snapshot):
         p = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         expected = {'редирект HTTP': '301', 'страница 404': '404'}.get(name)
         ok = p.returncode == 0 and (expected is None or p.stdout.strip() == expected)
-        print(('OK' if ok else 'ОШИБКА'), name, (p.stderr.strip() if not ok else ''))
+        notice(name + (': ' + p.stderr.strip() if not ok and p.stderr.strip() else ''), 'ok' if ok else 'error')
     cert_name = 'selfsteal-' + domain
     renewal = subprocess.run(['certbot', 'renew', '--dry-run', '--cert-name', cert_name],
                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    print('OK' if renewal.returncode == 0 else 'ОШИБКА', 'пробное продление сертификата')
+    notice('пробное продление сертификата', 'ok' if renewal.returncode == 0 else 'error')
     if renewal.returncode:
         print(renewal.stderr.strip())
     print('Далее вставьте inbound в Config Profile, примените профиль к ноде и настройте Host.')
@@ -362,25 +515,58 @@ def check_report(domain, ip, public, shortid, template, snapshot):
 
 
 def install():
+    heading('УСТАНОВКА')
     if CURRENT.exists():
         raise RuntimeError('Обнаружена существующая установка/незавершённая операция. Сначала выполните откат.')
-    if is_listening(80) or is_listening(8443):
-        raise RuntimeError('Порт 80 или 8443 уже занят. Изучите ss -lntp и освободите порт перед установкой.')
+    if is_listening(8443):
+        raise RuntimeError('Порт 8443 уже занят. Проверьте sudo ss -lntp и освободите порт перед установкой.')
+    reuse_nginx = False
+    if is_listening(80):
+        ok, reason = inspect_default_nginx()
+        if not ok:
+            raise RuntimeError('Порт 80 занят; автоматическое продолжение недоступно: ' + reason + '. Проверьте sudo nginx -T и sudo ss -lntp.')
+        notice('Порт 80 занят стандартной страницей nginx. Других сайтов в проверенной конфигурации не обнаружено.', 'warn')
+        notice('Скрипт сохранит ссылку на стандартный сайт и состояние nginx, затем переключит конфигурацию. При откате они восстановятся.')
+        if not confirm('Продолжить с установленным nginx?'):
+            notice('Установка отменена; никаких изменений не внесено.', 'info')
+            return
+        reuse_nginx = True
+    elif DEFAULT.exists() or DEFAULT.is_symlink():
+        enabled_names = {p.name for p in DEFAULT.parent.iterdir()}
+        conf_dir = Path('/etc/nginx/conf.d')
+        if (not DEFAULT.is_symlink() or not DEFAULT.exists()
+                or DEFAULT.resolve() != Path('/etc/nginx/sites-available/default').resolve()
+                or enabled_names != {'default'}
+                or (conf_dir.is_dir() and any(conf_dir.glob('*.conf')))
+                or not shutil.which('dpkg-query') or not packaged_nginx_configs_match()
+                or (shutil.which('nginx') and status_service('nginx', 'is-active'))):
+            raise RuntimeError('Обнаружена существующая конфигурация nginx; её нельзя безопасно отключить автоматически. Проверьте sudo nginx -T.')
     if HOOK.exists() or HOOK.is_symlink() or CONF.exists() or CONF.is_symlink() or ENABLED.exists() or ENABLED.is_symlink():
         raise RuntimeError('Файлы selfsteal-installer уже существуют без записи об установке. Проверьте их вручную.')
     domain, ip, email = input_parameters()
     cert_name = 'selfsteal-' + domain
     if Path('/etc/letsencrypt/renewal', cert_name + '.conf').exists() or Path('/etc/letsencrypt/live', cert_name).exists():
         raise RuntimeError('Сертификат с этим именем уже существует; установщик не будет его перезаписывать.')
-    if input('Будут установлены пакеты, изменены nginx и UFW. Продолжить? [yes/no]: ').strip().lower() != 'yes':
-        print('Отменено.')
+    if not confirm('Будут установлены пакеты, изменены nginx и UFW. Продолжить?'):
+        notice('Установка отменена.', 'info')
         return
     if not (shutil.which('ufw') and ufw_active()):
         print('UFW сейчас не активен. Его включение может закрыть порты других сервисов. Текущие слушающие службы:')
         print(output('ss', '-lntup'))
-        if input('Правила SSH, 80 и 443 будут добавлены. Включить UFW? [yes/no]: ').strip().lower() != 'yes':
-            print('Отменено до изменений.')
+        if not confirm('Правила SSH, 80 и 443 будут добавлены. Включить UFW?'):
+            notice('Отменено до изменений.', 'info')
             return
+    # Check again after user input, before creating a snapshot or changing services.
+    if is_listening(8443):
+        raise RuntimeError('За время подготовки порт 8443 был занят. Установка остановлена.')
+    if is_listening(80):
+        if not reuse_nginx:
+            raise RuntimeError('За время подготовки порт 80 был занят. Установка остановлена.')
+        ok, reason = inspect_default_nginx()
+        if not ok:
+            raise RuntimeError('Конфигурация nginx изменилась во время подготовки: ' + reason)
+    elif reuse_nginx:
+        raise RuntimeError('Состояние порта 80 изменилось во время подготовки. Запустите установку заново.')
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(STATE, 0o700)
     stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + os.urandom(3).hex()
@@ -395,6 +581,8 @@ def install():
              'ufw_was_active': ufw_active() if shutil.which('ufw') else False}
     save_state(state)
     try:
+        heading('ПАКЕТЫ И СЕТЬ')
+        notice('Снимок сохранён: ' + str(backup), 'ok')
         run('apt-get', 'update')
         run('apt-get', 'install', '-y', 'nginx', 'certbot', 'ufw', 'openssl', 'curl')
         for port in sorted(set(ssh_ports() + [80, 443])):
@@ -407,6 +595,7 @@ def install():
         remove_path(DEFAULT)
         run('systemctl', 'start', 'nginx')
         write_conf(nginx_config(domain, cert_name, False, False))
+        heading('СЕРТИФИКАТ')
         run('certbot', 'certonly', '--webroot', '-w', str(SITE), '--cert-name', cert_name,
             '-d', domain, '--agree-tos', '--email', email, '--non-interactive')
         state['cert_created'] = True
@@ -416,6 +605,7 @@ def install():
         if not match:
             raise RuntimeError('Не удалось определить версию nginx: ' + version)
         modern = tuple(map(int, match.groups())) >= (1, 25, 1)
+        heading('САЙТ И REALITY')
         template = render_site(domain)
         write_conf(nginx_config(domain, cert_name, modern, True))
         HOOK.parent.mkdir(parents=True, exist_ok=True)
@@ -430,31 +620,39 @@ def install():
 
 
 def main():
+    if sys.version_info < (3, 9):
+        sys.exit('Для установщика необходим Python 3.9 или новее.')
     if os.geteuid() != 0:
         sys.exit('Запустите от root: sudo bash install.sh')
     if not shutil.which('apt-get') or not shutil.which('systemctl') or not shutil.which('ss'):
         sys.exit('Поддерживаются серверы Ubuntu/Debian с apt, systemd и iproute2.')
+    banner()
     while True:
         info()
-        print('\n1. Установить\n2. Откатить последнюю установку\n3. Выход')
+        heading('ГЛАВНОЕ МЕНЮ')
+        print(f'  {styled("[1]", "cyan", True)}  Установить Selfsteal')
+        print(f'  {styled("[2]", "cyan", True)}  Откатить последнюю установку')
+        print(f'  {styled("[3]", "cyan", True)}  Выход из скрипта')
         try:
-            choice = input('Выбор: ').strip()
+            choice = prompt('Выберите действие: ').strip().casefold()
             if choice == '1':
                 install()
             elif choice == '2':
                 if not CURRENT.exists():
-                    print('Активный снимок не найден.')
-                elif input('Откатить конфигурацию этого установщика? [yes/no]: ').strip().lower() == 'yes':
+                    notice('Активный снимок не найден.', 'warn')
+                elif confirm('Откатить конфигурацию этого установщика?'):
                     rollback(read_state())
-            elif choice == '3':
+            elif choice in ('3', '0', 'q', 'quit', 'exit', 'выход'):
+                notice('Скрипт завершён. Вы вернулись в командную строку.', 'ok')
                 return
             else:
-                print('Выберите 1, 2 или 3.')
+                notice('Выберите 1, 2 или 3.', 'warn')
         except (EOFError, KeyboardInterrupt):
-            print('\nВыход.')
+            print()
+            notice('Скрипт завершён. Вы вернулись в командную строку.', 'ok')
             return
         except Exception as exc:
-            print('Ошибка:', exc, file=sys.stderr)
+            print(styled('  [×] Ошибка: ', 'red', True) + str(exc), file=sys.stderr)
 
 
 if __name__ == '__main__':
