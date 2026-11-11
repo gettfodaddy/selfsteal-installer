@@ -1,0 +1,4 @@
+# Tool Circuit — public collection
+User-agent: *
+Allow: /
+Sitemap: https://{{DOMAIN}}/sitemap.xml

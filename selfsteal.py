@@ -470,16 +470,25 @@ def make_profile(domain):
 
 def render_site(domain, source=None, site=SITE):
     choices = sorted((ROOT / 'templates').glob('*/index.html'))
-    if len(choices) != 20:
-        raise RuntimeError(f'Ожидается 20 шаблонов; найдено {len(choices)}')
+    if not choices:
+        raise RuntimeError('Шаблоны сайта не найдены.')
     source = source or random.SystemRandom().choice(choices)
     if source not in choices:
         raise ValueError('Неизвестный шаблон сайта')
     site.mkdir(parents=True, exist_ok=True)
     for filename in ('index.html', '404.html', 'favicon.svg'):
         shutil.copy2(source.parent / filename, site / filename)
-    (site / 'robots.txt').write_text(f'User-agent: *\nAllow: /\nSitemap: https://{domain}/sitemap.xml\n', encoding='utf-8')
-    (site / 'sitemap.xml').write_text(f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://{domain}/</loc></url></urlset>\n', encoding='utf-8')
+    for filename in ('robots.txt', 'sitemap.xml'):
+        content = (source.parent / filename).read_text(encoding='utf-8')
+        if '{{DOMAIN}}' not in content:
+            raise RuntimeError(f'В шаблоне {filename} отсутствует подстановка домена.')
+        (site / filename).write_text(content.replace('{{DOMAIN}}', domain), encoding='utf-8')
+    assets = site / 'site-assets'
+    if assets.is_symlink() or (assets.exists() and not assets.is_dir()):
+        raise RuntimeError('Некорректный каталог ресурсов сайта: site-assets')
+    if assets.exists():
+        shutil.rmtree(assets)
+    shutil.copytree(source.parent / 'site-assets', assets)
     return source.parent.name
 
 
@@ -496,8 +505,8 @@ def change_site():
     if not CONF.is_file() or not ENABLED.exists() or not status_service('nginx', 'is-active'):
         raise RuntimeError('Конфигурация Selfsteal не подключена или nginx не запущен.')
     choices = sorted((ROOT / 'templates').glob('*/index.html'))
-    if len(choices) != 20:
-        raise RuntimeError(f'Ожидается 20 шаблонов; найдено {len(choices)}')
+    if not choices:
+        raise RuntimeError('Шаблоны сайта не найдены.')
     print(f'  Домен: {domain}')
     print('  Доступные варианты:')
     for number, source in enumerate(choices, 1):
@@ -562,6 +571,8 @@ def check_report(domain, ip, public, shortid, template, snapshot):
         ('редирект HTTP', ['curl', '-fsS', '--noproxy', '*', '--resolve', f'{domain}:80:127.0.0.1', '-o', '/dev/null', '-w', '%{http_code}', f'http://{domain}/']),
         ('страница 404', ['curl', '-sS', '--noproxy', '*', '--resolve', f'{domain}:8443:127.0.0.1', '-o', '/dev/null', '-w', '%{http_code}', f'https://{domain}:8443/not-found-selfsteal-check']),
         ('robots.txt', ['curl', '-fsS', '--noproxy', '*', '--resolve', f'{domain}:8443:127.0.0.1', '-o', '/dev/null', f'https://{domain}:8443/robots.txt']),
+        ('sitemap.xml', ['curl', '-fsS', '--noproxy', '*', '--resolve', f'{domain}:8443:127.0.0.1', '-o', '/dev/null', f'https://{domain}:8443/sitemap.xml']),
+        ('стили сайта', ['curl', '-fsS', '--noproxy', '*', '--resolve', f'{domain}:8443:127.0.0.1', '-o', '/dev/null', f'https://{domain}:8443/site-assets/preview.css']),
         ('favicon.svg', ['curl', '-fsS', '--noproxy', '*', '--resolve', f'{domain}:8443:127.0.0.1', '-o', '/dev/null', f'https://{domain}:8443/favicon.svg']),
         ('срок сертификата более суток', ['openssl', 'x509', '-checkend', '86400', '-noout', '-in', f'/etc/letsencrypt/live/selfsteal-{domain}/fullchain.pem']),
     ]

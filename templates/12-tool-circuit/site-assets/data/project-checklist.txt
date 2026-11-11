@@ -1,0 +1,6 @@
+PROJECT CHECKLIST
+
+[ ] Define the goal
+[ ] Gather the files
+[ ] Check accessibility
+[ ] Publish and review
